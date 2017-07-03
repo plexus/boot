@@ -54,7 +54,7 @@
   [verbosity color args]
   (when (>= @*verbosity* verbosity)
     (binding [*out* *err*]
-      (print ((or color identity) (apply format args)))
+      (print (str (.getName (ManagementFactory/getRuntimeMXBean)) "\t" ((or color identity) (apply format args))))
       (flush))))
 
 (defmacro dbug*

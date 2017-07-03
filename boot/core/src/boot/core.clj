@@ -726,6 +726,15 @@
 
 ;; Boot Environment ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
+(defn take-queue [q]
+  (try
+    [(.take q)]
+    (catch Throwable t
+      (util/info "watch-dirs .take threw exception %s \n" (str t))
+      (binding [*out* *err*]
+        (.printStackTrace t))
+      nil)))
+
 (defn watch-dirs
   "Watches dirs for changes and calls callback with set of changed files
   when file(s) in these directories are modified. Returns a thunk which
@@ -737,20 +746,32 @@
   [callback dirs & {:keys [debounce]}]
   (if (empty? dirs)
     (constantly true)
-    (do (pod/require-in pod/worker-pod "boot.watcher")
-        (let [q       (LinkedBlockingQueue.)
-              watcher (apply file/watcher! :time dirs)
-              paths   (into-array String dirs)
-              k       (pod/with-invoke-worker (boot.watcher/make-watcher q paths))]
-          (daemon
-            (loop [ret (util/guard [(.take q)])]
-              (when ret
-                (if-let [more (.poll q (or debounce 10) TimeUnit/MILLISECONDS)]
-                  (recur (conj ret more))
-                  (let [changed (watcher)]
-                    (when-not (empty? changed) (callback changed))
-                    (recur (util/guard [(.take q)])))))))
-          #(pod/with-invoke-worker (boot.watcher/stop-watcher k))))))
+    (do
+      (pod/require-in pod/worker-pod "boot.watcher")
+      (let [q       (LinkedBlockingQueue.)
+            watcher (apply file/watcher! :time dirs)
+            paths   (into-array String dirs)
+            k       (pod/with-invoke-worker (boot.watcher/make-watcher q paths))]
+        (daemon
+         (try
+           (loop [ret (take-queue q)]
+             (util/info "watch-dirs received %s\n" (pr-str ret))
+             (when ret
+               (if-let [more (.poll q (or debounce 10) TimeUnit/MILLISECONDS)]
+                 (do
+                   (util/info "watch-dirs debouncing %s\n" (pr-str more))
+                   (recur (conj ret more)))
+                 (let [changed (watcher)]
+                   (util/info "watch-dirs handling %s %s\n" (pr-str ret) (pr-str changed))
+                   (when-not (empty? changed) (callback changed))
+                   (recur (take-queue q))))))
+           (catch Throwable t
+             (util/info "watch-dirs threw exception: %s\n" (str t)))
+           (finally
+             (util/info "watch-dirs has had enough\n" ))))
+        #(do
+           (util/info "watch-dirs: invoking stop-watcher\n" )
+           (pod/with-invoke-worker (boot.watcher/stop-watcher k)))))))
 
 (defn rebuild!
   "Manually trigger build watch."
