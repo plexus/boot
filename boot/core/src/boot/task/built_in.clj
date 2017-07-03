@@ -383,6 +383,14 @@
       (util/info "Writing target dir(s)...\n")
       (sync! fs :link (not no-link) :mode (mk-posix-file-permissions mode)))))
 
+(defn- take-queue [q]
+  (try
+    [(.take q)]
+    (catch Throwable e
+      (util/info "Watch queue .take threw exception")
+      (.printStackTrace e)
+      nil)))
+
 (core/deftask watch
   "Call the next handler when source files change."
 
@@ -408,29 +416,42 @@
                              (partial filter (comp f io/file second))))
             watch-target (if manual core/new-build-at core/last-file-change)]
         (.offer q (System/currentTimeMillis))
-        (add-watch watch-target k #(.offer q %4))
+        (add-watch watch-target k (fn [_ _ _ new-value]
+                                    (util/info "watch task notified of %s, putting it on the queue" (pr-str new-value) )
+                                    (.offer q new-value)))
         (core/cleanup (remove-watch watch-target k))
         (when-not quiet (util/info "\nStarting file watcher (CTRL-C to quit)...\n\n"))
-        (loop [ret (util/guard [(.take q)])]
-          (when ret
-            (if-let [more (.poll q (or debounce 10) TimeUnit/MILLISECONDS)]
-              (recur (conj ret more))
-              (let [start        (System/currentTimeMillis)
-                    etime        #(- (System/currentTimeMillis) start)
-                    changed      (when-not manual (incl-excl (watcher)))
-                    should-fire? (or manual (not (empty? changed)))]
-                (when should-fire?
-                  (when verbose
-                    (doseq [[op p _] changed]
-                      (util/info (format "\u25C9 %s %s\n" op p)))
-                    (util/info "\n"))
-                  (binding [*out* (if quiet (new java.io.StringWriter) *out*)
-                            *err* (if quiet (new java.io.StringWriter) *err*)]
-                    (core/reset-build!)
-                    (try (reset! return (-> fileset core/reset-fileset core/commit! next-task))
-                         (catch Throwable ex (util/print-ex ex)))
-                    (util/info "Elapsed time: %.3f sec\n\n" (float (/ (etime) 1000)))))
-                (recur (util/guard [(.take q)]))))))
+        (util/info "Starting watch loop...")
+        (try
+          (loop [ret (take-queue q)]
+            (when ret
+              (if-let [more (.poll q (or debounce 10) TimeUnit/MILLISECONDS)]
+                (do
+                  (util/info "watch task: debouncing %s" (pr-str more))
+                  (recur (conj ret more)))
+                (do
+                  (util/info "watch task: handling %s" (pr-str ret))
+                  (let [start        (System/currentTimeMillis)
+                        etime        #(- (System/currentTimeMillis) start)
+                        changed      (when-not manual (incl-excl (watcher)))
+                        should-fire? (or manual (not (empty? changed)))]
+                    (when should-fire?
+                      (when verbose
+                        (doseq [[op p _] changed]
+                          (util/info (format "\u25C9 %s %s\n" op p)))
+                        (util/info "\n"))
+                      (binding [*out* (if quiet (new java.io.StringWriter) *out*)
+                                *err* (if quiet (new java.io.StringWriter) *err*)]
+                        (core/reset-build!)
+                        (try (reset! return (-> fileset core/reset-fileset core/commit! next-task))
+                             (catch Throwable ex (util/print-ex ex)))
+                        (util/info "Elapsed time: %.3f sec\n\n" (float (/ (etime) 1000)))))
+                    (recur (take-queue q)))))))
+          (catch Throwable t
+            (util/warn "Watch loop threw exception")
+            (.printStackTrace t))
+          (finally
+            (util/info "Watch loop finished.")))
         @return))))
 
 (core/deftask repl
